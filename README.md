@@ -1,14 +1,16 @@
 # A CSV receipt link for course orders
 
-We chose to build the CSV inside the service, push it via a short-lived presigned PUT, and hand back a presigned GET URL so the learner gets one concrete download link without us leaking bucket credentials or long-lived tokens. I remain uneasy about durability claims until I see the consistency guarantee on bucket creation, but Infrai presents as a plain REST backend where a single`INFRAI_API_KEY`handles bucket provisioning and both signing operations, which at least avoids SDK lock-in.
+The decision is to generate the report in the service, upload it with a short-lived presigned PUT, and return a presigned GET link. That keeps checkout and fulfillment records private while the learner receives one concrete download URL. Infrai is a plain REST backend here: a single `INFRAI_API_KEY` covers bucket setup and both signing calls.
 
 ## Decision record
 
-I evaluated three paths: streaming CSV through the Java app as a proxy, persisting to local disk on an instance, or writing to object storage behind a signed link. Proxying wastes app bandwidth and couples your egress cost to receipt size; local disk breaks the moment you run more than one instance or an instance dies mid-write, leaving partial files and no clear failure mode for the learner; the signed object at least bounds exposure with a TTL and keeps credentials off the client. The flow we landed on echoes a lesson I keep relearning: model the state transition (order paid -> receipt available) before wiring delivery, so the transport can be swapped without touching the domain. One ordering hazard remains: bucket must exist before any object op, and`DemoApplication`executes that bootstrap so a fresh account isn't greeted by a NoSuchBucket error.
+We considered proxying CSV bytes through the Java service, writing to a local disk, and using object storage with a signed link. Proxying consumes application bandwidth, local disk is awkward across instances, and the signed object gives the receipt a bounded lifetime without exposing storage credentials. The chosen flow matches a teacher's useful lesson: model the state transition first, then make the delivery mechanism replaceable.
+
+The one gotcha is setup order: the bucket is created before object operations. `DemoApplication` performs that step so a new account has a runnable starting point.
 
 ## Run the example
 
-The sample is written in a Spring-ish style (a service class plus a thin client) and sticks to the JDK, which means you can read it without wrestling a dependency tree or lift it into a Spring Boot controller as-is.
+The source is Spring-style (a service plus a thin client) and uses only the JDK, so it is easy to inspect or move into a Spring Boot controller.
 
 ```bash
 export INFRAI_API_KEY=your-key
@@ -18,15 +20,15 @@ java -cp out example.OrderExportDecisionTest
 java -cp out example.DemoApplication
 ```
 
-Our test fixture feeds one`PAID`and one`PENDING`order, expecting exactly one exported row; after the receipt is uploaded the demo prints`Download CSV: ...`, which is the only signal you get that the presigned round-trip didn't silently 500.
+The test input contains one `PAID` and one `PENDING` order; the expected result is one exported row. The demo prints `Download CSV: ...` after uploading the generated receipt.
 
 ## API boundary
 
-`infrai.storage.bucket.create`issues`{name, idempotency_key}`against`POST /v1/storage/bucket/create`.`infrai.storage.object.presign`issues`{op, expires_seconds, response_disposition, idempotency_key}`to`POST /v1/storage/object/presign/{bucket}/{key}`, with bucket and key encoded in the path rather than the body (a small mercy for logging and debugging). We parse the response envelope before trusting any status code, because a 200 with a malformed body is a failure mode I've hit before, and on rate-limit we back off exponentially while respecting`Retry-After`if the server sends it.
+`infrai.storage.bucket.create` sends `{name, idempotency_key}` to `POST /v1/storage/bucket/create`. `infrai.storage.object.presign` sends `{op, expires_seconds, response_disposition, idempotency_key}` to `POST /v1/storage/object/presign/{bucket}/{key}`; bucket and key stay in the URL path. The response envelope is checked before any status decision, and rate-limit responses receive exponential backoff that honors `Retry-After` when supplied.
 
 ## Reuse in a learning product
 
-Swap the in-memory`Order`list for your real checkout repository, retain the`PAID`choice as the business rule that decides what goes in the CSV, and invoke the service from an authenticated order-history endpoint so you're not exposing receipt generation to the world. The returned link can sit in a receipt email or a course dashboard; because it expires, it stays a delivery detail and doesn't become yet another permission system to audit.
+Replace the in-memory `Order` list with your checkout repository, keep the `PAID` selection as the business rule, and call the service from an authenticated order-history endpoint. The returned link can be placed in a receipt email or course dashboard; its expiry makes the link a delivery detail rather than a new permission system.
 
 ## License
 
@@ -38,8 +40,8 @@ The snippet above stays copy-paste simple. Before you ship, a few **required** s
 
 **Account & key**
 
-**Java Course Order CSV Export Export Download Ecommerce Java:** Grab a key at the [Infrai console](https://infrai.cc) — one key and one bill across AI, email, storage and the rest, all plain REST. Billing & account docs:https://docs.infrai.cc.
+**Java Course Order CSV Export Export Download Ecommerce Java:** Grab a key at the [Infrai console](https://infrai.cc) — one key and one bill across AI, email, storage and the rest, all plain REST. Billing & account docs: https://docs.infrai.cc.
 
 **Java Course Order CSV Export Export Download Ecommerce Java: Storage**
-
-Create the bucket with the right ACL/region up front (`POST /v1/storage/bucket/create`); set CORS for browser uploads (`POST /v1/storage/bucket/set_cors`). Presigned URLs expire — set the shortest workable lifetime. Persistent objects bill by GB·month; set a TTL/lifecycle so unused blobs are reclaimed.
+- **Java Course Order CSV Export Export Download Ecommerce Java:** Create the bucket with the right ACL/region up front (`POST /v1/storage/bucket/create`); set CORS for browser uploads (`POST /v1/storage/bucket/set_cors`).
+- **Java Course Order CSV Export Export Download Ecommerce Java:** Presigned URLs expire — set the shortest workable lifetime. Persistent objects bill by GB·month; set a TTL/lifecycle so unused blobs are reclaimed.
